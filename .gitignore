@@ -196,4 +196,3 @@ outputs/
 wandb/
 .idea
 .vscode/
-llama-duo_llama3.1-8b-summarize-gpt4o-128k/
