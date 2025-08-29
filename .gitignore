@@ -199,6 +199,7 @@ wandb/
 bin/
 lib64
 pyvenv.cfg
+share/
 
 # macOS
 .DS_Store

@@ -13,6 +13,51 @@ from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, StateDictTy
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
+
+# FLOP counting utilities
+def count_model_flops(model, input_shape):
+    """Estimate FLOPs for model parameters"""
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # Rough estimate: 6 FLOPs per parameter (forward + backward + optimizer step)
+    batch_size, seq_len = input_shape
+    return total_params * batch_size * seq_len * 6
+
+
+def log_scaling_metrics(tracker, model_config, dataset_size, step, flops_per_step=None):
+    """Log scaling law metrics"""
+    # Calculate model parameters
+    hidden_size = model_config.hidden_size
+    num_layers = model_config.num_hidden_layers
+    intermediate_size = model_config.intermediate_size
+    vocab_size = model_config.vocab_size
+
+    # Estimate parameters (simplified)
+    params_per_layer = (
+        hidden_size * intermediate_size * 2  # MLP
+        + hidden_size * hidden_size * 4  # Attention
+        + hidden_size * 2  # Layer norms
+    )
+    total_params = (
+        params_per_layer * num_layers  # Layers
+        + vocab_size * hidden_size * 2  # Embeddings + output projection
+    )
+
+    metrics = {
+        "scaling/model_params": total_params,
+        "scaling/model_params_millions": total_params / 1e6,
+        "scaling/hidden_size": hidden_size,
+        "scaling/num_layers": num_layers,
+        "scaling/dataset_size": dataset_size,
+        "scaling/dataset_size_millions": dataset_size / 1e6,
+    }
+
+    if flops_per_step:
+        metrics["scaling/flops_per_step"] = flops_per_step
+        metrics["scaling/flops_per_step_billions"] = flops_per_step / 1e9
+
+    tracker.log(metrics, step=step)
+
+
 from specforge import (
     AutoDistributedTargetModel,
     AutoDraftModelConfig,
@@ -164,6 +209,20 @@ def parse_args():
     )  # 1024*28*28 for qwen2.5-vl
 
     parser.add_argument("--build-dataset-num-proc", type=int, default=8)
+
+    # scaling law experiment args
+    parser.add_argument(
+        "--data-fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of training data to use (0.0-1.0)",
+    )
+    parser.add_argument(
+        "--log-flops",
+        action="store_true",
+        help="Log FLOP counts for scaling law analysis",
+    )
+
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-start-step", type=int, default=30)
@@ -283,6 +342,15 @@ def main():
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+
+    # Apply data fraction for scaling law experiments
+    if args.data_fraction < 1.0:
+        original_size = len(train_dataset)
+        subset_size = int(original_size * args.data_fraction)
+        train_dataset = train_dataset.select(range(subset_size))
+        print_on_rank0(
+            f"Using {subset_size}/{original_size} samples ({args.data_fraction:.1%}) for scaling law experiment"
+        )
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -466,6 +534,22 @@ def main():
             if batch_index % args.draft_accumulation_steps == 0:
                 optimizer.step()
                 global_step += 1
+
+                # Log scaling metrics including FLOPs
+                if args.log_flops and global_step % args.log_steps == 0:
+                    input_shape = (
+                        data["input_ids"].shape[0],
+                        data["input_ids"].shape[1],
+                    )
+                    flops_per_step = count_model_flops(draft_model, input_shape)
+                    log_scaling_metrics(
+                        tracker,
+                        draft_model_config,
+                        len(train_eagle3_dataset),
+                        global_step,
+                        flops_per_step,
+                    )
+
                 if global_step % args.log_steps == 0:
                     tracker.log(log_dict, step=global_step)
                 log_dict = defaultdict(float)
