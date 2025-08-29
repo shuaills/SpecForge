@@ -196,6 +196,9 @@ outputs/
 wandb/
 .idea
 .vscode/
+bin/
+lib64
+pyvenv.cfg
 
 # macOS
 .DS_Store
