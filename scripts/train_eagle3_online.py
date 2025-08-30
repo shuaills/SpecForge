@@ -222,6 +222,13 @@ def parse_args():
         action="store_true",
         help="Log FLOP counts for scaling law analysis",
     )
+    parser.add_argument(
+        "--embedding-mode",
+        type=str,
+        default="truncate",
+        choices=["truncate", "trainable", "projection"],
+        help="How to handle embedding dimension mismatch: truncate (frozen), trainable (random init), projection (add linear layer)",
+    )
 
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--profile", action="store_true")
@@ -318,8 +325,16 @@ def main():
             .cuda()
             .to(torch.bfloat16)
         )
-    draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
-    draft_model.freeze_embedding()
+    draft_model.load_embedding(
+        args.target_model_path,
+        embedding_key=args.embedding_key,
+        embedding_mode=args.embedding_mode,
+    )
+    # Only freeze embedding if using truncate mode (trainable/projection modes need gradients)
+    if args.embedding_mode == "truncate":
+        draft_model.freeze_embedding()
+    else:
+        print_with_rank(f"Keeping embedding trainable for mode: {args.embedding_mode}")
     print_with_rank("Initialized draft model")
 
     # build dataloaders
@@ -422,6 +437,9 @@ def main():
             attention_backend=args.attention_backend,
         )
     # eagle3_model = DDP(eagle3_model, find_unused_parameters=True)
+    # Ensure all parameters are on the same device before FSDP
+    eagle3_model = eagle3_model.cuda()
+
     eagle3_model = FSDP(
         eagle3_model,
         use_orig_params=True,
@@ -432,6 +450,7 @@ def main():
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         ignored_modules=[target_model],
         process_group=get_dp_group(),
+        device_id=torch.cuda.current_device(),
     )
     print_with_rank("Initialized Eagle3 FSDP model")
 
@@ -653,7 +672,10 @@ def main():
                 draft_model_state_dict = {
                     k.replace("draft_model.", ""): v
                     for k, v in model_state_dict.items()
-                    if "draft_model." in k and "embed" not in k.lower()
+                    if "draft_model." in k
+                    and (
+                        "embed_tokens" not in k.lower() or "embedding_proj" in k.lower()
+                    )
                 }
 
                 if dist.get_rank() == 0:

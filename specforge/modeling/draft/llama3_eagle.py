@@ -870,11 +870,21 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return hidden_states
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+        embeddings = self.embed_tokens(input_ids)
+        # Apply projection if available (for scaling experiments)
+        if hasattr(self, "embedding_proj"):
+            embeddings = self.embedding_proj(embeddings)
+        return embeddings
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # eagle 3 requires hidden states from 3 layers
-        assert hidden_states.size(-1) == self.config.hidden_size * 3
+        if hasattr(self.config, "target_hidden_size"):
+            expected_size = self.config.target_hidden_size * 3
+        else:
+            expected_size = self.config.hidden_size * 3
+        assert (
+            hidden_states.size(-1) == expected_size
+        ), f"Expected hidden_states size {expected_size}, got {hidden_states.size(-1)}"
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:

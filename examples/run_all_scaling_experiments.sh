@@ -18,40 +18,41 @@ mkdir -p $LOG_DIR
 run_experiment() {
     local model_size=$1
     local data_frac=$2
-    local log_file="$LOG_DIR/experiment_${model_size}_${data_frac}data.log"
+    local embedding_mode=${3:-projection}  # Default to projection mode
+    local log_file="$LOG_DIR/experiment_${model_size}_${data_frac}data_${embedding_mode}emb.log"
 
-    echo "[$(date)] Starting experiment: $model_size with ${data_frac} data" | tee -a $log_file
-    bash $SCRIPT_DIR/run_llama3_eagle3_scaling.sh $model_size $data_frac 8 2>&1 | tee -a $log_file
+    echo "[$(date)] Starting experiment: $model_size with ${data_frac} data using ${embedding_mode} embedding" | tee -a $log_file
+    bash $SCRIPT_DIR/run_llama3_eagle3_scaling.sh $model_size $data_frac 8 $embedding_mode 2>&1 | tee -a $log_file
     local exit_code=${PIPESTATUS[0]}
 
     if [ $exit_code -eq 0 ]; then
-        echo "[$(date)] ✅ SUCCESS: $model_size with ${data_frac} data" | tee -a $log_file
+        echo "[$(date)] ✅ SUCCESS: $model_size with ${data_frac} data using ${embedding_mode} embedding" | tee -a $log_file
     else
-        echo "[$(date)] ❌ FAILED: $model_size with ${data_frac} data (exit code: $exit_code)" | tee -a $log_file
+        echo "[$(date)] ❌ FAILED: $model_size with ${data_frac} data using ${embedding_mode} embedding (exit code: $exit_code)" | tee -a $log_file
     fi
     echo "" | tee -a $log_file
 }
 
-# Parameter scaling experiments (fixed 1 layer, varying hidden size)
-echo "🔬 Running Parameter Scaling Experiments (hidden size scaling)..."
-run_experiment "tiny" "1.0"     # 512 hidden, ~1M params
-run_experiment "small" "1.0"    # 1024 hidden, ~8M params
-run_experiment "medium" "1.0"   # 2048 hidden, ~50M params
-run_experiment "original" "1.0" # 4096 hidden, ~530M params
-run_experiment "large" "1.0"    # 6144 hidden, ~1.2B params
-run_experiment "pro" "1.0"      # 8192 hidden, ~2.1B params
+# Parameter scaling experiments (fixed 1 layer, varying hidden size) with projection embedding
+echo "🔬 Running Parameter Scaling Experiments (hidden size scaling with projection embedding)..."
+run_experiment "tiny" "1.0" "projection"     # 512 hidden, ~1M params
+run_experiment "small" "1.0" "projection"    # 1024 hidden, ~8M params
+run_experiment "medium" "1.0" "projection"   # 2048 hidden, ~50M params
+run_experiment "original" "1.0" "projection" # 4096 hidden, ~530M params (no projection needed)
+run_experiment "large" "1.0" "projection"    # 6144 hidden, ~1.2B params
+run_experiment "pro" "1.0" "projection"      # 8192 hidden, ~2.1B params
 
-# Layer scaling experiments (fixed 4096 hidden, varying layers)
-echo "📚 Running Layer Scaling Experiments (depth scaling)..."
-run_experiment "original" "1.0" # 1 layer (baseline)
-run_experiment "2layer" "1.0"   # 2 layers
-run_experiment "4layer" "1.0"   # 4 layers
+# Layer scaling experiments (fixed 4096 hidden, varying layers) with projection embedding
+echo "📚 Running Layer Scaling Experiments (depth scaling with projection embedding)..."
+run_experiment "original" "1.0" "projection" # 1 layer (baseline, no projection needed but consistent)
+run_experiment "2layer" "1.0" "projection"   # 2 layers (no projection needed but consistent)
+run_experiment "4layer" "1.0" "projection"   # 4 layers (no projection needed but consistent)
 
-# Data scaling experiments (fixed medium model, varying data)
-echo "📊 Running Data Scaling Experiments..."
-run_experiment "medium" "0.1"   # 10% data
-run_experiment "medium" "0.5"   # 50% data
-run_experiment "medium" "1.0"   # 100% data (already done above)
+# Data scaling experiments (fixed medium model, varying data) with projection
+echo "📊 Running Data Scaling Experiments (with projection embedding)..."
+run_experiment "medium" "0.1" "projection"   # 10% data
+run_experiment "medium" "0.5" "projection"   # 50% data
+# 100% data already done in parameter scaling above
 
 echo "🎉 All scaling law experiments completed!"
 echo "Check logs in: $LOG_DIR"

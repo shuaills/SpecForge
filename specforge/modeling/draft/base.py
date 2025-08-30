@@ -118,10 +118,23 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         Freeze the embeddings of the draft model so that they are not updated during training.
         """
         self.embed_tokens.weight.requires_grad = False
+        if hasattr(self, "embedding_proj"):
+            self.embedding_proj.weight.requires_grad = False
+
+    def unfreeze_embedding(self):
+        """
+        Unfreeze the embedding layer for training.
+        """
+        self.embed_tokens.weight.requires_grad = True
+        if hasattr(self, "embedding_proj"):
+            self.embedding_proj.weight.requires_grad = True
 
     @torch.no_grad()
     def load_embedding(
-        self, model_path: str, embedding_key: str = "model.embed_tokens.weight"
+        self,
+        model_path: str,
+        embedding_key: str = "model.embed_tokens.weight",
+        embedding_mode: str = "truncate",
     ) -> None:
         """
         Load the embedding of the draft model.
@@ -129,6 +142,11 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         Args:
             model_path (str): Path to the target model. Can be either a Hugging Face
             repository ID or a local directory path containing the model files.
+            embedding_key (str): Key for the embedding tensor in the model.
+            embedding_mode (str): How to handle dimension mismatch:
+                - "truncate": Truncate or pad with zeros (default, frozen)
+                - "trainable": Initialize randomly and make trainable
+                - "projection": Add projection layer from target to draft dimensions
         """
         if os.path.exists(model_path):
             # model_path is a local directory
@@ -141,13 +159,19 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
                 safetensors_path = os.path.join(model_path, "model.safetensors")
                 if os.path.exists(safetensors_path):
                     with safe_open(safetensors_path, framework="pt") as f:
-                        self.embed_tokens.weight.copy_(f.get_tensor(embedding_key))
+                        emb_tokens = f.get_tensor(embedding_key)
+                        self._handle_embedding_dimension_mismatch(
+                            emb_tokens, embedding_mode
+                        )
                     return
 
                 pytorch_model_path = os.path.join(model_path, "pytorch_model.bin")
                 if os.path.exists(pytorch_model_path):
                     state_dict = torch.load(pytorch_model_path, map_location="cpu")
-                    self.embed_tokens.weight.copy_(state_dict[embedding_key])
+                    emb_tokens = state_dict[embedding_key]
+                    self._handle_embedding_dimension_mismatch(
+                        emb_tokens, embedding_mode
+                    )
                     return
 
                 raise FileNotFoundError(
@@ -171,12 +195,111 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
             else:
                 state_dict = torch.load(os.path.join(model_path, ckpt_file))
                 emb_tokens = state_dict[embedding_key]
-            self.embed_tokens.weight.copy_(emb_tokens)
+            self._handle_embedding_dimension_mismatch(emb_tokens, embedding_mode)
         else:
             # this is the case where model_path is a huggingface repository
             # we first need to locate its local cache
             local_cache_path = snapshot_download(repo_id=model_path)
-            self.load_embedding(local_cache_path, embedding_key)
+            self.load_embedding(local_cache_path, embedding_key, embedding_mode)
+
+    def _handle_embedding_dimension_mismatch(
+        self, emb_tokens: torch.Tensor, embedding_mode: str
+    ) -> None:
+        """
+        Handle embedding dimension mismatch with different strategies.
+
+        Args:
+            emb_tokens: Target model embeddings
+            embedding_mode: Strategy to handle dimension mismatch
+        """
+        if emb_tokens.shape == self.embed_tokens.weight.shape:
+            # Perfect match, just copy
+            self.embed_tokens.weight.copy_(emb_tokens)
+            return
+
+        vocab_size, target_hidden_size = emb_tokens.shape
+        draft_vocab_size, draft_hidden_size = self.embed_tokens.weight.shape
+
+        print(
+            f"Embedding dimension mismatch: target {target_hidden_size} -> draft {draft_hidden_size}"
+        )
+        print(f"Using embedding mode: {embedding_mode}")
+
+        if embedding_mode == "truncate":
+            # Original truncate/pad strategy (frozen)
+            if draft_hidden_size <= target_hidden_size:
+                # Truncate target embeddings to draft size
+                emb_tokens_adapted = emb_tokens[:, :draft_hidden_size]
+            else:
+                # Pad target embeddings with zeros to match draft size
+                padding_size = draft_hidden_size - target_hidden_size
+                padding = torch.zeros(
+                    vocab_size,
+                    padding_size,
+                    dtype=emb_tokens.dtype,
+                    device=emb_tokens.device,
+                )
+                emb_tokens_adapted = torch.cat([emb_tokens, padding], dim=1)
+
+            self.embed_tokens.weight.copy_(emb_tokens_adapted)
+            self.freeze_embedding()
+
+        elif embedding_mode == "trainable":
+            # Initialize randomly and make trainable
+            print("Initializing embedding weights randomly for training")
+            torch.nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=0.02)
+            self.unfreeze_embedding()
+
+        elif embedding_mode == "projection":
+            # Add projection layer from target to draft dimensions
+            print(
+                f"Adding projection layer: {target_hidden_size} -> {draft_hidden_size}"
+            )
+
+            # Use target embeddings directly
+            if target_hidden_size != draft_hidden_size:
+                # Need to resize embedding layer
+                import torch.nn as nn
+
+                original_dtype = self.embed_tokens.weight.dtype
+                original_device = self.embed_tokens.weight.device
+                self.embed_tokens = nn.Embedding(
+                    vocab_size,
+                    target_hidden_size,
+                    padding_idx=self.embed_tokens.padding_idx,
+                )
+                self.embed_tokens = self.embed_tokens.to(
+                    device=original_device, dtype=original_dtype
+                )
+                self.embed_tokens.weight.copy_(emb_tokens)
+                self.freeze_embedding()
+
+                # Add projection layer with same dtype as existing model parameters
+                self.embedding_proj = nn.Linear(
+                    target_hidden_size, draft_hidden_size, bias=False
+                )
+                torch.nn.init.normal_(self.embedding_proj.weight, mean=0.0, std=0.02)
+                self.embedding_proj.weight.requires_grad = True
+
+                # Move projection layer to same device and dtype as embeddings
+                if self.embed_tokens.weight.is_cuda:
+                    self.embedding_proj = self.embedding_proj.cuda(
+                        self.embed_tokens.weight.device
+                    )
+
+                # Ensure projection layer has same dtype as embedding weights
+                self.embedding_proj = self.embedding_proj.to(
+                    dtype=self.embed_tokens.weight.dtype
+                )
+            else:
+                # Same dimension, just copy
+                self.embed_tokens.weight.copy_(emb_tokens)
+                self.freeze_embedding()
+
+        else:
+            raise ValueError(
+                f"Unknown embedding_mode: {embedding_mode}. Use 'truncate', 'trainable', or 'projection'"
+            )
 
     def load_vocab_mapping(self, file_path: str) -> None:
         """
